@@ -1,5 +1,7 @@
 # 将 Superpowers 移植到新的宿主环境（Harness）
 
+> 翻译自官方文档 [Porting Superpowers to a New Harness](../docs/porting-to-a-new-harness.md)
+
 本指南介绍了如何为新的宿主环境（即 IDE、CLI 或 Agent 运行器，而非 Claude Code）添加支持，使 Superpowers 技能能够像在原生环境中一样自动触发。
 
 文档分为两个层次。**第 1-3 部分**解释了系统的工作原理以及如何判断某个宿主环境是否受支持；在动手修改任何内容之前，请务必阅读这些部分。**第 4-8 部分**是为 Agent（在人类伙伴监督下）执行端到端移植直至分发的规定流程。附录索引了当前的参考集成实现，以便你复制最接近的版本。

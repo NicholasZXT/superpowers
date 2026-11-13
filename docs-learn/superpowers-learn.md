@@ -20,9 +20,91 @@
 
 ---
 
-## 1. 仓库架构
+## 1. 仓库结构
 
-### 1.1 三层结构（`docs/porting-to-a-new-harness.md` Part 1）
+---
+
+### 1.1 `hooks/` —— shell-hook 型 harness 的 bootstrap 注入器
+
+| 文件                        | 作用                                                                                                                                                                                                                                                                              |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `hooks/hooks.json`        | **Claude Code** hook 配置。`SessionStart`，matcher = `startup\|clear\|compact`（**刻意不含 `resume`**），命令 `"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd" session-start`，`"shell": "bash"`，`async: false`（必须同步，否则首轮可能在注入前就开始 — #571） |
+| `hooks/hooks-cursor.json` | **Cursor** 变体，schema 完全不同：`{"version":1,"hooks":{"sessionStart":[{"command":"./hooks/run-hook.cmd session-start"}]}}` —— 小写 `sessionStart`、相对路径、无 `matcher`/`type`/`async`                                                                     |
+| `hooks/run-hook.cmd`      | **polyglot 分发器**（同一文件既是合法 batch 又是合法 bash）。Windows 上依次尝试 `C:\Program Files\Git\bin\bash.exe` → `Program Files (x86)` → PATH 上的 `bash`；找不到 bash 则 `exit /b 0` 静默退出（harness 仍可用，仅无注入）                                   |
+| `hooks/session-start`     | **真正的注入逻辑**。**无扩展名是刻意的**：Claude Code 在 Windows 会给含 `.sh` 的命令自动前置 `bash`，会造成重复调用                                                                                                                                               |
+
+#### `session-start` 的三分支输出（最易踩的坑）
+
+| 判断条件                                             | 输出形状                                                                                     | 平台                   |
+| ---------------------------------------------------- | -------------------------------------------------------------------------------------------- | ---------------------- |
+| `CURSOR_PLUGIN_ROOT` 已设置                        | `{ "additional_context": "…" }`                                                           | Cursor                 |
+| `CLAUDE_PLUGIN_ROOT` 设置且 `COPILOT_CLI` 未设置 | `{ "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": "…" } }` | Claude Code            |
+| 其他                                                 | `{ "additionalContext": "…" }`                                                            | Copilot CLI / SDK 标准 |
+
+> **为什么必须严格只输出一个字段**：Claude Code 会同时读 `additional_context` 和 `hookSpecificOutput` 且**不去重**，同时输出会**双重注入**。
+
+其他实现细节：
+
+- 用 `${s//old/new}` 参数替换做 JSON 转义（曾用逐字符循环，在 Git Bash 上耗时 60s+）
+- 用 `printf` 而非 heredoc（规避 bash 5.3+ heredoc hang，#571）
+- 每个 `printf` 通过 `cat` 吸收 broken pipe（Windows 曾每会话报写错误，#1612）
+
+### 1.2 `scripts/` —— 仓库维护脚本（与运行时无关）
+
+| 脚本                                         | 作用                                                                                                                                                                                                                         |
+| -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bump-version.sh` + `.version-bump.json` | 按声明表同步所有 manifest 的 version（支持`plugins.0.version` 嵌套路径），并做仓库级漂移审计                                                                                                                               |
+| `lint-shell.sh`                            | ShellCheck +`shfmt`，默认只查改动过的 shell 文件                                                                                                                                                                           |
+| `sync-to-codex-plugin.sh`                  | 把受版本控制的插件文件 rsync 到外部 fork（`prime-radiant-inc/openai-codex-plugins`）的 `plugins/superpowers/`，提交并开 PR。带**锚定**的 EXCLUDES 列表（防止一个 harness 的 dotdir 泄漏到另一个 harness 的分发物） |
+| `package-codex-plugin.sh`                  | 生成 Codex portal 上传用的确定性归档（归一化时间戳、保留执行权限、校验每个 skill 带 OpenAI 元数据、拒绝脏工作区）                                                                                                            |
+
+### 1.3 `skills/` —— 内容本体
+
+- **14 个 skill 目录**，**扁平命名空间**
+- frontmatter **只有两个必需字段**：`name` + `description`（上限 1024 字符；其余字段见 agentskills.io 规范）
+- `description` 规则（关键）：**只写触发条件，绝不概括流程**（见 §3.2）
+- 支撑文件通过 SKILL.md 的**相对路径**引用，例：
+  - `test-driven-development/SKILL.md` → `[writing-good-tests.md](writing-good-tests.md)`
+  - `requesting-code-review/SKILL.md` → `[code-reviewer.md](code-reviewer.md)`
+  - `subagent-driven-development/SKILL.md` → `./implementer-prompt.md`、`./task-reviewer-prompt.md`、`./re-review-prompt.md`、`../requesting-code-review/code-reviewer.md`
+- **`skills/using-superpowers/`** 是入口，同时存放 `references/<harness>-tools.md`（现有 5 份：`codex`、`pi`、`gemini`、`antigravity`、`hermes`）
+- 隐式仓库根依赖（拷贝时需注意）：
+  - `skills/brainstorming/scripts/server.cjs` 的 `readSuperpowersVersion()` 向上三级读 `package.json`，读不到再退 `.codex-plugin/plugin.json`
+  - `skills/brainstorming/SKILL.md:250` 用的是**仓库根相对路径** `skills/brainstorming/visual-companion.md`（不是 `./`）
+  - `skills/subagent-driven-development/scripts/*` 依赖 `git rev-parse --show-toplevel`
+
+### 1.4 各 harness 专用目录
+
+先看**集成形态**（Part 4 把形态分为 A/B/C 三类）：
+
+| 目录 / 文件                                                     | Harness      | 形态                  | 关键内容                                                                                                                                                                                                                                                         |
+| --------------------------------------------------------------- | ------------ | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `.claude-plugin/plugin.json`                                  | Claude Code  | **A**           | **刻意不写 `skills`/`hooks` 字段** —— Claude 按约定自动发现 `skills/` 和 `hooks/hooks.json`。同目录 `marketplace.json` 为开发用 marketplace（`source: "./"`）                                                                                |
+| `.cursor-plugin/plugin.json`                                  | Cursor       | **A**           | 显式`"skills": "./skills/"` + `"hooks": "./hooks/hooks-cursor.json"` —— **Shape A 的参考模板**                                                                                                                                                       |
+| `.codex-plugin/plugin.json`                                   | Codex        | 无 hook               | 有`"skills": "./skills/"`；`"hooks": {}` 是**必须的空对象**：缺 `hooks` 字段时 Codex 会 fallback 去自动发现 `hooks/hooks.json`（即 Claude 的 SessionStart hook）。`[]`、缺字段、空内联列表都会 collapse 回 fallback，必须是 `{}`               |
+| `.agents/plugins/marketplace.json`                            | Codex        | 分发                  | Codex marketplace 要求在 marketplace 根有此文件，否则能命名 marketplace 却找不到可安装条目                                                                                                                                                                       |
+| `.opencode/plugins/superpowers.js` + `.opencode/INSTALL.md` | OpenCode     | **B**           | `config` hook 把 skills 目录 push 进 `config.skills.paths`（无需 symlink）；`experimental.chat.messages.transform` 把 bootstrap **作为 user message unshift 到首条用户消息**，用 `EXTREMELY_IMPORTANT` 标记去重，模块级缓存                        |
+| `.pi/extensions/superpowers.ts`                               | pi           | **B**           | `resources_discover` → `skillPaths`；`session_start`/`session_compact` 置 `injectBootstrap=true`，`agent_end` 清掉；`context` 事件插入 user message 且**跳过开头的 compactionSummary**；模块级缓存。**无原生 skill 工具时的最佳参考** |
+| `gemini-extension.json` + 根 `GEMINI.md`                    | Gemini CLI   | **C**           | manifest 用`"contextFileName": "GEMINI.md"`（**不写 skills 字段**，Gemini 自动发现随扩展打包的 `skills/`）；`GEMINI.md` 内容就两行 `@`-include                                                                                                     |
+| `.kimi-plugin/plugin.json`                                    | Kimi Code    | 声明式                | `"skills": "./skills/"` + `"sessionStart": {"skill": "using-superpowers"}` + 内联 `skillInstructions`（工具映射）。无需 hook、无需拷贝、无 symlink                                                                                                         |
+| `.devin-plugin/plugin.json`                                   | Devin CLI    | 无 hook               | 只有元数据；Devin 自动发现**同目录的** `skills/`，并在 system prompt 列出每个 skill 的 name+description，用原生 `skill` 工具调用                                                                                                                       |
+| `.hermes-plugin/`（`plugin.yaml` + `__init__.py`）        | Hermes Agent | **B**（Python） | `provides_hooks: [pre_llm_call]`；`register(ctx)` 逐个 `ctx.register_skill(name, Path(skill_md))` —— **必须传 `pathlib.Path`**，传 `str` 会让 Hermes 静默禁用整个插件；`is_first_turn` 时 `return {"context": bootstrap}`                  |
+| 根`package.json`                                              | pi           | B 的元数据            | `main` 指向 OpenCode 插件；`pi.extensions` / `pi.skills` 声明 pi 侧资源；`pi-package` keyword                                                                                                                                                            |
+| `.version-bump.json`                                          | 全仓         | 发布                  | 列出所有带版本的 manifest 及其字段路径。**新 harness 若不登记就会发旧版本**                                                                                                                                                                                |
+
+**两种注入策略的差异（Shape B 的坑）**：
+
+- OpenCode 是**每 agent step** 都触发 transform → 靠**每次调用的去重 guard**
+- pi 是**每 turn** 触发 → 靠**lifecycle flag + `agent_end` 重置**
+- 把一方的去重策略套到另一方会破坏注入
+
+---
+
+## 2. 架构和集成形态
+
+参考仓库里的官方文档 `docs/porting-to-a-new-harness.md` Part 1。
+
+### 2.1 三层结构
 
 ```mermaid
 flowchart TB
@@ -54,93 +136,14 @@ flowchart TB
 > **"The bootstrap is the entire integration."**
 > 没有它：skill 文件存在于磁盘，但永远不会在正确时机被调用。
 
-### 1.2 两条不可违反的规则
+### 2.2 两条不可违反的规则
 
 1. **Skills 只写动作，不写工具名。** 移植时**禁止**改 `skills/*/SKILL.md` 正文去适配工具名——修复属于"工具映射"。
    （唯一例外：`SKILL.md` 的 *Platform Adaptation* 指针清单可以加一行。）
 2. **一切通过 harness 自己的安装机制投递，绝不改用户文件。** 不允许写 `~/.gemini/GEMINI.md`、`settings.json`、`~/.bashrc` 等。若安装机制确实无法承载 bootstrap，应**上报为限制**，而不是手改用户配置。
 
----
 
-### 1.3 `hooks/` —— shell-hook 型 harness 的 bootstrap 注入器
-
-| 文件                        | 作用                                                                                                                                                                                                                                                                              |
-| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `hooks/hooks.json`        | **Claude Code** hook 配置。`SessionStart`，matcher = `startup\|clear\|compact`（**刻意不含 `resume`**），命令 `"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd" session-start`，`"shell": "bash"`，`async: false`（必须同步，否则首轮可能在注入前就开始 — #571） |
-| `hooks/hooks-cursor.json` | **Cursor** 变体，schema 完全不同：`{"version":1,"hooks":{"sessionStart":[{"command":"./hooks/run-hook.cmd session-start"}]}}` —— 小写 `sessionStart`、相对路径、无 `matcher`/`type`/`async`                                                                     |
-| `hooks/run-hook.cmd`      | **polyglot 分发器**（同一文件既是合法 batch 又是合法 bash）。Windows 上依次尝试 `C:\Program Files\Git\bin\bash.exe` → `Program Files (x86)` → PATH 上的 `bash`；找不到 bash 则 `exit /b 0` 静默退出（harness 仍可用，仅无注入）                                   |
-| `hooks/session-start`     | **真正的注入逻辑**。**无扩展名是刻意的**：Claude Code 在 Windows 会给含 `.sh` 的命令自动前置 `bash`，会造成重复调用                                                                                                                                               |
-
-#### `session-start` 的三分支输出（最易踩的坑）
-
-| 判断条件                                             | 输出形状                                                                                     | 平台                   |
-| ---------------------------------------------------- | -------------------------------------------------------------------------------------------- | ---------------------- |
-| `CURSOR_PLUGIN_ROOT` 已设置                        | `{ "additional_context": "…" }`                                                           | Cursor                 |
-| `CLAUDE_PLUGIN_ROOT` 设置且 `COPILOT_CLI` 未设置 | `{ "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": "…" } }` | Claude Code            |
-| 其他                                                 | `{ "additionalContext": "…" }`                                                            | Copilot CLI / SDK 标准 |
-
-> **为什么必须严格只输出一个字段**：Claude Code 会同时读 `additional_context` 和 `hookSpecificOutput` 且**不去重**，同时输出会**双重注入**。
-
-其他实现细节：
-
-- 用 `${s//old/new}` 参数替换做 JSON 转义（曾用逐字符循环，在 Git Bash 上耗时 60s+）
-- 用 `printf` 而非 heredoc（规避 bash 5.3+ heredoc hang，#571）
-- 每个 `printf` 通过 `cat` 吸收 broken pipe（Windows 曾每会话报写错误，#1612）
-
-### 1.4 `scripts/` —— 仓库维护脚本（与运行时无关）
-
-| 脚本                                         | 作用                                                                                                                                                                                                                         |
-| -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `bump-version.sh` + `.version-bump.json` | 按声明表同步所有 manifest 的 version（支持`plugins.0.version` 嵌套路径），并做仓库级漂移审计                                                                                                                               |
-| `lint-shell.sh`                            | ShellCheck +`shfmt`，默认只查改动过的 shell 文件                                                                                                                                                                           |
-| `sync-to-codex-plugin.sh`                  | 把受版本控制的插件文件 rsync 到外部 fork（`prime-radiant-inc/openai-codex-plugins`）的 `plugins/superpowers/`，提交并开 PR。带**锚定**的 EXCLUDES 列表（防止一个 harness 的 dotdir 泄漏到另一个 harness 的分发物） |
-| `package-codex-plugin.sh`                  | 生成 Codex portal 上传用的确定性归档（归一化时间戳、保留执行权限、校验每个 skill 带 OpenAI 元数据、拒绝脏工作区）                                                                                                            |
-
-### 1.5 `skills/` —— 内容本体
-
-- **14 个 skill 目录**，**扁平命名空间**
-- frontmatter **只有两个必需字段**：`name` + `description`（上限 1024 字符；其余字段见 agentskills.io 规范）
-- `description` 规则（关键）：**只写触发条件，绝不概括流程**（见 §3.2）
-- 支撑文件通过 SKILL.md 的**相对路径**引用，例：
-  - `test-driven-development/SKILL.md` → `[writing-good-tests.md](writing-good-tests.md)`
-  - `requesting-code-review/SKILL.md` → `[code-reviewer.md](code-reviewer.md)`
-  - `subagent-driven-development/SKILL.md` → `./implementer-prompt.md`、`./task-reviewer-prompt.md`、`./re-review-prompt.md`、`../requesting-code-review/code-reviewer.md`
-- **`skills/using-superpowers/`** 是入口，同时存放 `references/<harness>-tools.md`（现有 5 份：`codex`、`pi`、`gemini`、`antigravity`、`hermes`）
-- 隐式仓库根依赖（拷贝时需注意）：
-  - `skills/brainstorming/scripts/server.cjs` 的 `readSuperpowersVersion()` 向上三级读 `package.json`，读不到再退 `.codex-plugin/plugin.json`
-  - `skills/brainstorming/SKILL.md:250` 用的是**仓库根相对路径** `skills/brainstorming/visual-companion.md`（不是 `./`）
-  - `skills/subagent-driven-development/scripts/*` 依赖 `git rev-parse --show-toplevel`
-
-### 1.6 各 harness 专用目录
-
-先看**集成形态**（Part 4 把形态分为 A/B/C 三类）：
-
-| 目录 / 文件                                                     | Harness      | 形态                  | 关键内容                                                                                                                                                                                                                                                         |
-| --------------------------------------------------------------- | ------------ | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `.claude-plugin/plugin.json`                                  | Claude Code  | **A**           | **刻意不写 `skills`/`hooks` 字段** —— Claude 按约定自动发现 `skills/` 和 `hooks/hooks.json`。同目录 `marketplace.json` 为开发用 marketplace（`source: "./"`）                                                                                |
-| `.cursor-plugin/plugin.json`                                  | Cursor       | **A**           | 显式`"skills": "./skills/"` + `"hooks": "./hooks/hooks-cursor.json"` —— **Shape A 的参考模板**                                                                                                                                                       |
-| `.codex-plugin/plugin.json`                                   | Codex        | 无 hook               | 有`"skills": "./skills/"`；`"hooks": {}` 是**必须的空对象**：缺 `hooks` 字段时 Codex 会 fallback 去自动发现 `hooks/hooks.json`（即 Claude 的 SessionStart hook）。`[]`、缺字段、空内联列表都会 collapse 回 fallback，必须是 `{}`               |
-| `.agents/plugins/marketplace.json`                            | Codex        | 分发                  | Codex marketplace 要求在 marketplace 根有此文件，否则能命名 marketplace 却找不到可安装条目                                                                                                                                                                       |
-| `.opencode/plugins/superpowers.js` + `.opencode/INSTALL.md` | OpenCode     | **B**           | `config` hook 把 skills 目录 push 进 `config.skills.paths`（无需 symlink）；`experimental.chat.messages.transform` 把 bootstrap **作为 user message unshift 到首条用户消息**，用 `EXTREMELY_IMPORTANT` 标记去重，模块级缓存                        |
-| `.pi/extensions/superpowers.ts`                               | pi           | **B**           | `resources_discover` → `skillPaths`；`session_start`/`session_compact` 置 `injectBootstrap=true`，`agent_end` 清掉；`context` 事件插入 user message 且**跳过开头的 compactionSummary**；模块级缓存。**无原生 skill 工具时的最佳参考** |
-| `gemini-extension.json` + 根 `GEMINI.md`                    | Gemini CLI   | **C**           | manifest 用`"contextFileName": "GEMINI.md"`（**不写 skills 字段**，Gemini 自动发现随扩展打包的 `skills/`）；`GEMINI.md` 内容就两行 `@`-include                                                                                                     |
-| `.kimi-plugin/plugin.json`                                    | Kimi Code    | 声明式                | `"skills": "./skills/"` + `"sessionStart": {"skill": "using-superpowers"}` + 内联 `skillInstructions`（工具映射）。无需 hook、无需拷贝、无 symlink                                                                                                         |
-| `.devin-plugin/plugin.json`                                   | Devin CLI    | 无 hook               | 只有元数据；Devin 自动发现**同目录的** `skills/`，并在 system prompt 列出每个 skill 的 name+description，用原生 `skill` 工具调用                                                                                                                       |
-| `.hermes-plugin/`（`plugin.yaml` + `__init__.py`）        | Hermes Agent | **B**（Python） | `provides_hooks: [pre_llm_call]`；`register(ctx)` 逐个 `ctx.register_skill(name, Path(skill_md))` —— **必须传 `pathlib.Path`**，传 `str` 会让 Hermes 静默禁用整个插件；`is_first_turn` 时 `return {"context": bootstrap}`                  |
-| 根`package.json`                                              | pi           | B 的元数据            | `main` 指向 OpenCode 插件；`pi.extensions` / `pi.skills` 声明 pi 侧资源；`pi-package` keyword                                                                                                                                                            |
-| `.version-bump.json`                                          | 全仓         | 发布                  | 列出所有带版本的 manifest 及其字段路径。**新 harness 若不登记就会发旧版本**                                                                                                                                                                                |
-
-**两种注入策略的差异（Shape B 的坑）**：
-
-- OpenCode 是**每 agent step** 都触发 transform → 靠**每次调用的去重 guard**
-- pi 是**每 turn** 触发 → 靠**lifecycle flag + `agent_end` 重置**
-- 把一方的去重策略套到另一方会破坏注入
-
----
-
-## 2. 集成形态与"能否直接拷贝"
-
-### 2.1 硬需求（一票否决）
+### 2.3 集成的前置硬条件
 
 > **automatic session-start injection**：能在**每次会话开始**把文本注入模型上下文，且**不需要用户每会话 opt-in**。
 
@@ -148,7 +151,7 @@ flowchart TB
 
 不可接受：需要用户粘贴 prompt / 跑命令 / 开启某模式。→ 验收测试必然失败。
 
-### 2.2 三种形态
+### 2.4 三种集成形态
 
 | 形态                                       | 特征                                                | 参考实现                                                                              |
 | ------------------------------------------ | --------------------------------------------------- | ------------------------------------------------------------------------------------- |
@@ -162,7 +165,7 @@ flowchart TB
 - Codex/Devin 属"**surfaced skill index**"软路径：靠 harness 在会话开始暴露每个 skill 的 name+description 触发，**只 bootstrap 触发、不 bootstrap 工具映射**，且无结构保证
 - "无 skill 系统"的 harness 需自备发现路径：生成 skill 索引（会过期）或指示运行时列举 `skills/*/SKILL.md`（推荐，永不过期）
 
-### 2.3 能否直接把 `skills/` 拷到目标 Agent 的 skills 目录？
+### 2.5 能否直接把 `skills/` 拷到目标 Agent 的 skills 目录？
 
 **可以当实验起点，但达不到可用标准**，会坏在四处：
 
@@ -206,9 +209,9 @@ IF A SKILL APPLIES TO YOUR TASK, YOU DO NOT HAVE A CHOICE. YOU MUST USE IT.
 - `"Fix this bug"` → 先 `systematic-debugging`，再 domain skills
 - **Plan mode 拦截**：进入 plan mode 前若未 brainstorming，必须先 brainstorming
 
-### 3.4 Red Flags 表（反合理化装置）
+### 3.4 Red Flags 表
 
-不列"要做什么"，而是**预先列出模型会想到的作弊念头并逐条反驳**：
+不列"要做什么"，而是**预先列出模型会想到的作弊念头并逐条反驳**（反合理化装置）：
 
 | 模型的想法                | 反驳                                               |
 | ------------------------- | -------------------------------------------------- |
@@ -282,7 +285,9 @@ flowchart TB
 - `executing-plans` 与 `subagent-driven-development` 都以 `REQUIRED SUB-SKILL: Use superpowers:finishing-a-development-branch` 收尾
 - `systematic-debugging` Phase 4 点名 `superpowers:test-driven-development` 与 `superpowers:verification-before-completion`
 
-### 4.1 brainstorming 的三条路径（v6.3.0 #2063「Ceremony now scales to the task」）
+### 4.1 brainstorming 的三条路径
+
+参考 v6.3.0 版本的 Issue #2063「Ceremony now scales to the task」。
 
 先分类，且**必须把分类说出口**让用户可否决：
 
@@ -410,7 +415,9 @@ flowchart TB
 
 ## 6. 规范文件产出
 
-**分两类性质完全不同的文件**：① 提交进 repo 的"规格资产"；② git-ignored 的"运行时草稿"。
+**分两类性质完全不同的文件**：
+1. 提交进 repo 的"规格资产"；
+2. git-ignored 的"运行时草稿"。
 
 ```mermaid
 flowchart TB
@@ -570,7 +577,7 @@ Task <N>: Ruling: <finding> — <决定与理由>
 
 ---
 
-## 7. 交互模型：无需 slash command
+## 7. 交互模型
 
 ### 7.1 结论
 
